@@ -1,0 +1,395 @@
+* Ceph 存储集群部署
+** 参考文档
+   [[https://blog.51cto.com/tryingstuff/2376390][Ceph 手工部署13.2版本_断尾壁虎的技术博客_51CTO博客]]
+   [[https://docs.ceph.com/en/latest/install/install-storage-cluster/][Install Ceph Storage Cluster — Ceph Documentation]]
+   Add OSD：[[https://docs.ceph.com/en/latest/install/manual-deployment/#adding-osds][Manual Deployment — Ceph Documentation]]
+   Filestore：[[https://docs.ceph.com/en/latest/install/manual-deployment/#filestore][Manual Deployment — Ceph Documentation]]
+   内核版本支持：[[https://docs.ceph.com/en/latest/rados/operations/crush-map/#tunables][CRUSH Maps — Ceph Documentation]]
+** 系统环境
+   节点：采用 3 节点组成集群
+   系统：CentOS7.5
+   内核：4.x 长期支持
+   磁盘：（生产环境可采取 RAID 方案）
+   版本：Ceph Mimic 13.x
+** 集群环境
+   1) 通过主机名相互解析
+   2) 防火墙和 SELinux 关闭或授权
+   3) 时间通过 ntp 同步
+   4) Ceph 程序依赖 epel 源
+** 程序安装
+   (所有节点安装)
+   #+begin_src sh
+     # (处理依赖)
+     yum -y install snappy leveldb gdisk python-argparse gperftools-libs
+
+     # 添加 ceph release repo
+     rpm --import 'https://download.ceph.com/keys/release.asc'
+     rpm -Uvh 'https://download.ceph.com/rpm-mimic/el7/noarch/ceph-release-1-0.el7.noarch.rpm'
+
+     # 替换 repo 为阿里云 mirror
+     sed -i 's|http://download.ceph.com|https://mirrors.aliyun.com/ceph|' /etc/yum.repos.d/ceph.repo
+
+     # 开始安装
+     yum -y install epel-release
+     yum -y install ceph -y # --disablerepo=epel
+
+     # 检查程序
+     rpm -qa | egrep -i "ceph|rados|rbd"
+   #+end_src
+** 集群部署
+*** 部署 Monitor
+    #+begin_src sh
+      # 生成空配置文件（否则初始化 Monitor 时会提示找不到配置文件错误信息）
+      mkdir /etc/ceph/
+      touch /etc/ceph/ceph.conf
+
+      # 初始化全局 FSID
+      FSID=`uuidgen`
+
+      # 创建集群密钥环，生成 Monitor 服务密钥
+      ceph-authtool --create-keyring /tmp/ceph.mon.keyring --gen-key -n mon. --cap mon 'allow *'
+
+      # 创建管理员密钥环，创建 client.admin 用户并添加至密钥环中
+      ceph-authtool --create-keyring /etc/ceph/ceph.client.admin.keyring --gen-key -n client.admin --cap mon 'allow *' --cap osd 'allow *' --cap mds 'allow *' --cap mgr 'allow *'
+
+      # 创建 bootstrap-osd 密钥环，创建 client.bootstrap-od 用户并添加至密钥环中（Bootstrap-OSD 将会由 Monitor 生成 OSD 密钥）
+      ceph-authtool --create-keyring /var/lib/ceph/bootstrap-osd/ceph.keyring --gen-key -n client.bootstrap-osd --cap mon 'profile bootstrap-osd'
+
+      # 将以上密钥加入 ceph.mon.keyring（集群）管理
+      ceph-authtool /tmp/ceph.mon.keyring --import-keyring /etc/ceph/ceph.client.admin.keyring
+      ceph-authtool /tmp/ceph.mon.keyring --import-keyring /var/lib/ceph/bootstrap-osd/ceph.keyring
+
+      # 配置 Monitor ID、IP 和 FSID 生成 monitor map
+      MON_HOST="node1"
+      MON_IP='192.168.121.3'
+      monmaptool --create --add $MON_HOST $MON_IP --fsid $FSID /tmp/monmap
+
+      # 创建数据目录（格式为：{CLUSTER-HOST}）
+      mkdir /var/lib/ceph/mon/ceph-$MON_HOST
+
+      # 初始化 Monitor （填入 MON 守护进程信息）
+      ceph-mon --mkfs -i $MON_HOST --monmap /tmp/monmap --keyring /tmp/ceph.mon.keyring
+
+      # 编写配置
+      vi /etc/ceph/ceph.conf
+      [global]
+      fsid =                       # 生成的FSID
+      mon initial members =        # 主机名
+      mon host =                   # 对应的IP
+      public network = 192.168.121.0/24         
+      auth cluster required = cephx
+      auth service required = cephx
+      auth client required = cephx
+      osd journal size = 1024
+      osd pool default size = 3
+      osd pool default min size = 2
+      osd pool default pg num = 333
+      osd pool default pgp num = 333
+      osd crush chooseleaf type = 1
+
+      # 默认的 systemd 管理通过 ceph 用户启动服务，设置权限
+      chown -R ceph:ceph /var/lib/ceph
+
+      # 启动 Monitor
+      systemctl start ceph-mon@$MON_HOST.service
+
+      # 确保启动成功
+      ceph -s
+      netstat -lntp | grep ceph-mon
+    #+end_src
+*** 部署 Manager
+    建议在每个 Monitor 节点启用 Manager 服务从而实现相同的可用性
+    #+begin_src sh
+      # 创建认证密钥
+      #NAME="ceph-mgr"
+      NAME="node1"
+      ceph auth get-or-create mgr.$NAME mon 'allow profile mgr' osd 'allow *' mds 'allow *'
+
+      # 创建 Manager 数据目录，用于存储密钥(格式为：{CLUSTER-HOST})
+      sudo -u ceph mkdir /var/lib/ceph/mgr/ceph-$NAME
+
+      # 存储 Manager 密钥
+      vi /var/lib/ceph/mgr/ceph-$NAME/keyring
+
+      # 启动服务
+      ceph-mgr -i $NAME
+
+      # 确认服务健康
+      ceph -s
+      netstat -lntp | grep ceph
+    #+end_src
+
+    启用模块
+    #+begin_src sh
+      # 检查所有模块
+      ceph mgr module ls
+
+      # 启用模块
+      ceph mgr module enable dashboard
+      ceph mgr module ls | head
+
+      # 禁用模块
+      ceph mgr module disable dashboard
+
+      # 查看开启的服务地址（某些模块加载时发布其地址（如 http 服务））
+      ceph mgr service
+    #+end_src
+
+    配置初次启动集群默认启用的模块，注意集群的其余声明周期将会忽略此设置，仅将其用于引导
+    在 Monitor 第一次启动前在 ceph.conf 添加配置
+    #+begin_src sh
+      [mon]
+	  mgr initial modules = dashboard balancer
+    #+end_src
+
+    首先出现的 manager 实例由 monitor 标记为 active，其余为 backup（非仲裁选主模式）
+    当 active 的 manager 超过 mon_mgr_beacon_grace 时间未发送信号时，backup 将会升级为 active
+
+    通过 ceph mgr fail <mgr name> 将 manager 守护进程显示标记为失败可进行抢占故障转移
+
+    查看相关模块的帮助：src_sh{ceph tell mgr help}
+*** 创建 OSD
+    默认的 OSD 池（osd pool default size = 3）要求至少 3 个 OSD 守护进程处理对象的副本数，否则集群无法达到 active+clean 状态
+    在 monitor 被引导后，集群拥有默认的 CRUSH 映射；不论如何 CRUSH 映射没有映射到 Ceph 节点的任何 Ceph OSD 守护进程
+
+    Ceph 提供了 ceph-volume 工具，可用于初始化被用于 Ceph 的逻辑卷、磁盘和分区。
+    该工具通过索引递增创建 OSD ID，同时会将新的 OSD 添加至主机下的 CRUSH 映射中。
+    
+    查看 CLI 详细信息和帮助：src_sh{ceph-volume -h}
+
+    在所有创建 OSD 的 node 进行：
+    #+begin_src sh
+      ### Bluestore 架构
+
+      ## 方法一
+      ceph-volume lvm create --data /dev/vdb
+      ceph-volume lvm list
+
+      ## 方法二：通过更细致的参数，分为两步进行
+      # 准备 OSD
+      #ceph-volume lvm prepare --data {data-path} {data-path}
+      ceph-volume lvm prepare --data /dev/vdc
+
+      # 激活 OSD
+      ceph-volume lvm list # 根据 ID 和 FSID 激活 OSD
+      #ceph-volume lvm activate {ID} {FSID}
+      ceph-volume lvm activate 1 7d170e50-a603-4d02-ad4b-e2bcf7d0823f
+
+      # 查看 OSD 状态
+      ceph osd tree
+
+      ## 查看 ceph 状态
+      ceph -s
+      netstat -lntp | grep ceph
+
+      ### Filestore 架构
+      略
+    #+end_src
+** 扩展集群
+   确保程序安装
+*** 扩展 Monitor
+    #+begin_src sh
+      ## Monitor 操作 
+      # 修改 Monitor 配置
+      vi /etc/ceph/ceph.conf
+      ..
+      mon initial members = node1,node2
+      mon host = 10.0.0.1,10.0.0.2
+      ..
+      [mon]
+      mon allow pool delete = true
+
+      # 同步配置文件和管理员密钥环
+      scp /etc/ceph/* node2:/etc/ceph/
+
+      ## 新节点操作
+      # 初始化 Ceph 目录
+      mkdir -p /var/lib/ceph/{bootstrap-mds,bootstrap-mgr,bootstrap-osd,bootstrap-rbd,bootstrap-rgw,mds,mgr,mon,osd}
+      chown -R ceph:ceph /var/lib/ceph
+
+      # 创建 Monitor 数据目录
+      NODE=node2
+      NODE_IP=192.168.121.27
+      sudo -u ceph mkdir /var/lib/ceph/mon/ceph-$NODE   # 指定node名称ID
+
+      # 更新配置文件
+      vi /etc/ceph/ceph.conf
+      [mon.$NODE]
+      mon_addr = $NODE_IP:6789
+      host = $NODE
+
+      # 获取 Monitor Keyring 和集群 Monmap
+      ceph auth get mon. -o /tmp/monkeyring
+      ceph mon getmap -o /tmp/monmap
+
+      # 初始化 Monitor 
+      sudo -u ceph ceph-mon --mkfs -i $NODE --monmap /tmp/monmap --keyring /tmp/monkeyring
+
+      # 启动
+      systemctl start ceph-mon@$NODE
+
+      # 确认集群状态
+      ceph -s
+      ceph mon stat
+    #+end_src
+*** 扩展 Manager
+    与部署步骤相同
+*** 扩展 OSD
+    (添加 OSD 时后端存储架构要与原集群保持一致)
+    #+begin_src sh
+      # 获取配置文件和密钥
+      scp node1:/etc/ceph/ceph.conf /etc/ceph/
+      scp node1:/etc/ceph/ceph.client.admin.keyring /etc/ceph/
+
+      # 获取 OSD Bootstrap 密钥环
+      scp -p node1:/var/lib/ceph/bootstrap-osd/ceph.keyring /var/lib/ceph/bootstrap-osd/
+
+      # 添加 OSD
+      ceph-volume lvm create --data /dev/vdb
+
+      # 检查集群状态
+      ceph -s
+    #+end_src
+** 文件系统
+   CephFS 需要 MDS 服务支撑
+*** 部署 MDS
+    #+begin_src sh
+      # 创建数据目录
+      #mkdir -p /var/lib/ceph/mds/{cluster-name}-{id}   # 这里的ID设置为本地主机名
+      sudo -u ceph mkdir -p /var/lib/ceph/mds/ceph-$NODE
+
+      # 创建密钥环
+      #ceph-authtool --create-keyring /var/lib/ceph/mds/{cluster-name}-{id}/keyring --gen-key -n mds.{id}
+      ceph-authtool --create-keyring /var/lib/ceph/mds/ceph-$NODE/keyring --gen-key -n mds.$NODE
+
+      # 导入密钥环，并指定权限（caps）
+      #ceph auth add mds.{id} osd "allow rwx" mds "allow" mon "allow profile mds" -i /var/lib/ceph/mds/{cluster}-{id}/keyring
+      ceph auth add mds.$NODE osd "allow rwx" mds "allow" mon "allow profile mds" -i /var/lib/ceph/mds/ceph-$NODE/keyring
+
+      # 配置 MDS
+      vi /etc/ceph/ceph.conf
+
+      [mds.$NODE]            # 添加此处的配置
+      host = $NODE
+
+      # 启动服务测试（指定 monitor 地址）
+      ceph-mds --cluster ceph -i $NODE -m $MON_NODE:6789
+
+      # 检查服务状态
+      ceph mds stat
+
+      # 通过 systemd 管理服务
+      pkill ceph-mds
+      chown -R ceph:ceph /var/lib/ceph/mds/
+      systemctl start ceph-mds@$NODE
+      systemctl enable ceph-mds@$NODE
+
+      # 检查服务启动状态
+      ps -ef|grep ceph-mds
+      netstat -lntp|grep ceph-mds
+
+      # 检查 ceph 集群状态
+      ceph -s
+    #+end_src
+*** 创建文件系统
+    CephFS 需要(至少)两个 RADOS Pool，分别用于存储数据以及元数据
+
+    对元数据池使用更高的复制级别，否则该池的任何数据丢失将会导致整个文件系统无法访问
+    使用较低延迟的存储介质（如 SSD）作为元数据池，该池直接影响客户端文件系统操作延迟
+
+    #+begin_src sh
+      ## 创建 Pools
+      #ceph osd pool create cephfs_data <pg_num>
+      #ceph osd pool create cephfs_metadata <pg_num>
+      ceph osd pool create cephfs_data 64
+      ceph osd pool create cephfs_metadata 64
+
+      ## 创建 Filesystem
+      ceph fs new cephfs cephfs_metadata cephfs_data
+
+      ## 检查文件系统
+      ceph fs ls
+      ceph mds stat
+    #+end_src
+
+    在多 CephFS 集群内可以通过 src_sh{ceph fs set-default} 指定默认挂载盘，用户无需指定具体挂载的文件系统
+*** 挂载文件系统
+    文件系统通过 Monitor （挂载）发现 MDS，+并由其同时保证服务可用（挂载失败时检查）
+    (通过测试可以发现，可以在任何ceph集群节点上挂载，共享文件) # 扯淡
+    (指定的 mon 必须是正常状态，如果不是 active 或 standby 则不能挂载)
+
+    +测试 Ceph 挂载只需指定某一个 Monitor，当指定的 Monitor 不可用时客户端将会自动切换集群中其他 Monitor
+**** 用户态工具挂载
+     需要 ceph-release 安装
+     #+begin_src sh
+       # 安装用户态 ceph-fuse 客户端工具
+       yum -y install ceph-fuse #--disablerepo=epel #(非ceph集群中的主机需要开启epel安装依赖包) # 备注：需要 epel
+
+       # 配置与密钥分发（(如果客户端是 ceph 集群节点则可忽略)）
+       mkdir /etc/ceph
+       scp node1:/etc/ceph/ceph.conf /etc/ceph/
+       scp node1:/etc/ceph/ceph.client.admin.keyring /etc/ceph/
+
+       # 挂载文件系统
+       mkdir /mnt/cephfs
+       ceph-fuse -m node1:6789 /mnt/cephfs
+
+       # 检查文件系统
+       df -h |grep cephfs
+     #+end_src
+**** 内核态模块挂载
+     内核驱动挂载对内核版本有一定要求
+     当启用 CRUSH Tunables（可调参数） Jewel 时，官方建议 4.14/4.9 核心版本
+     低于 4.5 版本内核挂载错误，建议使用 ceph-fuse
+     +在 CentOS7.8 3.10.0-1127.el7.x86_64 成功挂载
+     #+begin_src 
+       local-node-1 kernel: libceph: mon0 10.0.0.2:6789 feature set mismatch, my 107b84a842aca < server's 40107b84a842aca, missing 400000000000000
+       local-node-1 kernel: libceph: mon0 10.0.0.2:6789 missing required protocol features
+     #+end_src
+
+     +当前版本默认为 jewel 10.x
+     或通过修改降低 CRUSH Tunables（(默认 default，实际上为 jewel 10.x ?)）为 Hammer 以支持 4.1 或更高版本内核
+     #+begin_src sh
+       # 查看 CRUSH Tunables
+       ceph osd crush dump
+       ceph osd crush show-tunables
+
+       # 降低为 Hammer 0.9.x
+       ceph osd crush tunables hammer
+     #+end_src
+
+     挂载
+     #+begin_src sh
+       # 方式一：
+       mount -t ceph node1:6789:/ /mnt -o name=admin,secret=AQDo1aVcQ+Z0BRAAENyooUgFgokkjw9hBUOseg==
+
+       #方式二：
+       mount -t ceph node1:6789:/ /mnt -o name=admin,secretfile=/tmp/keyring   
+       # keyring只包含密钥，不包含其它任何参数
+     #+end_src
+*** 删除文件系统
+    删除前 MDS 服务需要停机
+    #+begin_src sh
+      ## 关闭 MDS 服务(?不规范)
+      ceph mds stat
+      ceph mds fail node3
+      systemctl stop ceph-mds@$NODE
+
+      ## 删除 Filesystem
+      ceph fs ls
+      ceph fs rm cephfs --yes-i-really-mean-it 
+
+      ## 删除 Pool
+      ceph osd lspools
+      ceph osd pool delete cephfs_data cephfs_data --yes-i-really-really-mean-it
+      ceph osd pool delete cephfs_metadata cephfs_metadata --yes-i-really-really-mean-it
+
+      ## 确认集群状态
+      ceph -s 
+    #+end_src
+** 个人理解
+*** rados/crush/osd
+    RADOS Pool 抽象 OSDs，RADOS 中由 CRUSH 算法映射到 OSD 守护进程
+    OSD 承载对象（object）副本（PG）
+
+
