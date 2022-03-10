@@ -1,0 +1,113 @@
+* Chef 自动化平台部署
+  
+** 参考文档
+   [[https://www.cyberithub.com/how-to-install-chef-13-on-redhat-centos-7/][How to Install Chef 13 on RedHat/CentOS 7 | CyberITHub]]
+   下载：[[https://www.chef.io/downloads][Chef Software Downloads | Automation, DevOps, Security, DevSecOps | Chef]]
+   
+** 系统环境
+   节点：采用 3 环境模拟
+   系统：Redhat7/CentOS7
+   版本：Chef 13
+   
+** 组件环境
+   1) 所有节点安装 wget
+   2) 符合组件最小配置要求
+      Chef Server - 4 CPU, 4 GB Memory
+      Chef Workstation - 1 CPU, 1 GB Memory
+      Chef Client - 1 CPU, 1 GB Memory
+   3) 通过主机名相互解析（使用 FQDN）
+   4) 在 Workerstation 节点安装 git
+   
+** 组件部署
+   Chef 将基础设施定义为代码，用 Chef recipe 定义服务器。
+   
+*** 部署 Server
+    任何更便后需要执行重新配置并检查状态
+    
+    #+begin_src sh
+      # 下载 Chef Server Core
+      wget https://packages.chef.io/files/stable/chef-server/13.2.0/el/7/chef-server-core-13.2.0-1.el7.x86_64.rpm
+      rpm -ivh chef-server-core-13.2.0-1.el7.x86_64.rpm
+
+      # 初始化/重新配置
+      chef-server-ctl reconfigure
+
+      # 检查状态
+      chef-server-ctl status
+
+      # 创建 admin 用户
+      #Syntax:- chef-server-ctl user-create USER_NAME FIRST_NAME LAST_NAME EMAIL 'PASSWORD' -f PATH_FILE_NAME
+      chef-server-ctl user-create admin John Wick admin@cyberithub.local test@123$ -f /etc/chef/admin.pem
+
+      # 创建组织并关联到以上用户（确保 short_name 为小写）
+      #Syntax:- chef-server-ctl org-create short_name 'full_organization_name' --association_user user_name --filename ORGANIZATION-validator.pem
+      chef-server-ctl org-create cyberithub "CyberITHub, Inc" --association_user admin -f /etc/chef/cyberithub-validator.pem
+
+      # 防火墙允许 http 和 https 流量
+      firewall-cmd --permanent --zone public --add-service http
+      firewall-cmd --permanent --zone public --add-service https
+      firewall-cmd --reload
+    #+end_src
+        
+*** 部署 Workstation
+    当 Server 配置了 FQDN 时，其生成的证书使用 FQDN 解析，配置 knife.rb 和 hosts 使用 FQDN
+    
+    #+begin_src sh
+      # 下载并安装
+      wget https://packages.chef.io/files/stable/chefdk/4.6.35/el/7/chefdk-4.6.35-1.el7.x86_64.rpm
+      rpm -ivh chefdk-4.6.35-1.el7.x86_64.rpm
+
+      # 验证开发工具
+      chef verify
+
+      # 创建仓库
+      chef generate repo chef-repo
+      ls -lrt chef-repo/
+
+      # 配置 git 用户和邮件地址
+      git config --global user.name "admin"
+      git config --global user.email "admin@cyberithub.local"
+
+      # 初始化
+      cd ~/chef-repo/
+      git init
+
+      # 创建存储 RSA 密钥的路径并使 git 忽略推送
+      mkdir -p ~/chef-repo/.chef
+      echo '.chef' >> ~/chef-repo/.gitignore
+
+      # 进行首次提交
+      git add .
+      git commit -m "initial commit"
+
+      # 拷贝 Server 生成的 admin 密钥（.pem 包含公钥和私钥）
+      scp -pr root@node1:/etc/chef/admin.pem ~/chef-repo/.chef/
+      scp -pr root@node1:/etc/chef/cyberithub-validator.pem ~/chef-repo/.chef/
+
+      # 配置 knife 命令使用的 knife.rb 文件（修改 chef_server_url）
+      vi /root/chef-repo/.chef/knife.rb
+      current_dir = File.dirname(__FILE__)
+      log_level :info
+      log_location STDOUT
+      node_name "admin"
+      client_key "#{current_dir}/admin.pem"
+      validation_client_name "cyberithub-validator"
+      validation_key "#{current_dir}/cyberithub-validator.pem"
+      chef_server_url "https://chef-server/organizations/cyberithub"
+      syntax_check_cache_path "#{ENV['HOME']}/.chef/syntaxcache"
+      cookbook_path ["#{current_dir}/../cookbooks"]
+
+      # 信任 server 自签证书
+      knife ssl fetch
+
+      # 检查客户端
+      knife client list
+    #+end_src
+    
+*** 引导 Client
+    #+begin_src sh
+      knife bootstrap node3 -x root -P vagrant --sudo
+
+      # 检查节点
+      knife node list
+    #+end_src
